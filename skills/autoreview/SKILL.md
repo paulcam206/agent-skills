@@ -140,6 +140,12 @@ that refusal.
 - Explicit provider / non-auth failure: no automatic auth fallback.
 - Force configured route: `--codex-config 'model_provider="review_api"'`;
   `review_api` must match operator `CODEX_HOME/config.toml`.
+- Local provider: an operator-selected unauthenticated `http://` loopback `/v1`
+  Responses provider with an explicit port keeps its routing. Only provider
+  selection and endpoint cross isolation; no credential files or env, retries and
+  WebSockets off. Credential-bearing or malformed config refuses before launch
+  (no OpenAI fallback). Repository-local config is never a source. Needs
+  Python 3.11 or `tomli`.
 
 ### Copilot subagent review
 

@@ -11,6 +11,7 @@ import copy
 import functools
 import hashlib
 import io
+import ipaddress
 import json
 import math
 import os
@@ -4944,6 +4945,92 @@ def codex_auth_helper_home(repo: Path) -> Path:
         ) from None
 
 
+CODEX_LOCAL_PROVIDER_CREDENTIAL_KEYS = (
+    "auth", "env_key", "experimental_bearer_token", "http_headers",
+    "env_http_headers", "query_params",
+)
+CODEX_LOCAL_PROVIDER_CREDENTIAL_ENV = (
+    "OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY", "OPENAI_BASE_URL",
+    "OPENAI_ORGANIZATION", "OPENAI_PROJECT", "AZURE_OPENAI_ENDPOINT",
+)
+
+
+def codex_local_provider_flags(config: dict[str, Any], provider_id: str) -> list[str] | None:
+    """Project an operator's unauthenticated HTTP loopback Responses provider.
+
+    Only provider selection and its endpoint cross the isolation boundary.
+    Non-loopback providers return None for the other routes to judge; an unsafe
+    loopback provider is refused rather than dropped to the default route.
+    """
+    providers = config.get("model_providers")
+    provider = providers.get(provider_id) if isinstance(providers, dict) else None
+    if provider_id == "openai" or not isinstance(provider, dict) or not isinstance(provider.get("base_url"), str):
+        return None
+    try:
+        endpoint = urllib.parse.urlsplit(provider["base_url"])
+        address = ipaddress.ip_address(endpoint.hostname or "")
+    except ValueError:
+        return None
+    if not address.is_loopback:
+        return None
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_-]+", provider_id)
+        or endpoint.scheme != "http"
+        or endpoint.username is not None
+        or endpoint.password is not None
+        or endpoint.query
+        or endpoint.fragment
+        or endpoint.path.rstrip("/") != "/v1"
+        or provider.get("wire_api", "responses") != "responses"
+        or provider.get("requires_openai_auth", False) is not False
+        or any(key in provider for key in CODEX_LOCAL_PROVIDER_CREDENTIAL_KEYS)
+    ):
+        raise SystemExit(
+            "Codex inference configuration refused: local provider must be an "
+            "unauthenticated HTTP loopback Responses endpoint"
+        )
+    try:
+        if endpoint.port is None or endpoint.port < 1:
+            raise ValueError("missing or invalid port")
+    except ValueError:
+        raise SystemExit(
+            "Codex inference configuration refused: local provider requires an explicit valid port"
+        ) from None
+    prefix = f"model_providers.{provider_id}"
+    settings = {
+        "model_provider": provider_id,
+        f"{prefix}.name": provider_id,
+        f"{prefix}.base_url": provider["base_url"],
+        f"{prefix}.wire_api": "responses",
+        f"{prefix}.requires_openai_auth": False,
+        f"{prefix}.supports_websockets": False,
+        f"{prefix}.request_max_retries": 0,
+        f"{prefix}.stream_max_retries": 0,
+    }
+    return [part for key, value in settings.items() for part in ("-c", f"{key}={toml_value(value)}")]
+
+
+def codex_configured_local_provider_flags(repo: Path) -> list[str] | None:
+    source_home = codex_source_home(repo)
+    if source_home is None:
+        return None
+    config_path = source_home / "config.toml"
+    if not external_env_path(repo, str(config_path)):
+        return None
+    config = load_codex_auth_config(config_path)
+    provider_id = config.get("model_provider")
+    if not isinstance(provider_id, str):
+        return None
+    return codex_local_provider_flags(config, provider_id)
+
+
+def codex_route_is_local_provider(flags: Sequence[str]) -> bool:
+    return any(
+        re.fullmatch(r'model_providers\.[A-Za-z0-9_-]+\.base_url="http://.*', flag)
+        for flag in flags
+    )
+
+
 def load_codex_inference_route(
     repo: Path, overrides: Sequence[str] = (),
 ) -> tuple[list[str], bytes | None]:
@@ -4957,8 +5044,12 @@ def load_codex_inference_route(
         if key.strip() == "model_provider"
     ]
     if not selectors:
-        # Unselected provider/profile/tuning settings keep their historical
+        # An operator-selected loopback provider keeps its routing; otherwise
+        # unselected provider/profile/tuning settings keep their historical
         # auth-only behavior, including on hosts without a TOML parser.
+        local_flags = codex_configured_local_provider_flags(repo)
+        if local_flags is not None:
+            return local_flags, None
         return codex_auth_config_flags(repo), None
     if len(selectors) != 1:
         refuse("select exactly one model_provider")
@@ -4997,6 +5088,9 @@ def load_codex_inference_route(
     )
     if config.get("model_provider") != provider_id:
         refuse("selected model_provider must match the operator config")
+    local_flags = codex_local_provider_flags(config, provider_id)
+    if local_flags is not None:
+        return local_flags, None
     if any(key in config for key in ("profile", "openai_base_url")):
         refuse("profile or base URL overrides cannot be projected as one inference route")
     if provider_id in {"openai", "ollama", "lmstudio", "amazon-bedrock", "amazon-bedrock-runtime"}:
@@ -5145,6 +5239,7 @@ def codex_runtime_env(
     *,
     file_auth_linked: bool,
     command_auth: bool = False,
+    local_provider: bool = False,
 ) -> dict[str, str]:
     runtime_home = runtime_root / "home"
     runtime_config = runtime_home / ".config"
@@ -5168,7 +5263,7 @@ def codex_runtime_env(
         if command_auth or file_auth_linked or source_codex_home is None
         else source_codex_home
     )
-    return safe_engine_env(
+    env = safe_engine_env(
         repo,
         [Path(codex_bin).parent],
         engine="codex",
@@ -5185,6 +5280,11 @@ def codex_runtime_env(
             "CODEX_HOME": str(active_codex_home),
         },
     )
+    if local_provider:
+        # An unauthenticated local provider needs no OpenAI credential or endpoint.
+        for key in CODEX_LOCAL_PROVIDER_CREDENTIAL_ENV:
+            env.pop(key, None)
+    return env
 
 
 def ensure_codex_isolation_supported(
@@ -5743,6 +5843,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             overrides = codex_config_overrides(args)
             route = load_codex_inference_route(repo, overrides)
             command_auth = any(flag.startswith("model_provider=") for flag in route[0])
+            local_provider = codex_route_is_local_provider(route[0])
             auth_fallback = load_codex_auth_fallback_route(repo, overrides, command_auth=command_auth)
             if auth_fallback is not None and codex_subscription_login_missing(
                 resolve_command(args.codex_bin, repo), temp_root,
@@ -5800,6 +5901,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                             cmd[0],
                             file_auth_linked=file_auth_linked,
                             command_auth=command_auth,
+                            local_provider=local_provider,
                         ),
                     )
                 except EngineInterrupted as exc:

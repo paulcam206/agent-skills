@@ -69,6 +69,15 @@ Profile settings remain ignored. Force configured route before subscription atte
 - Omitted `wire_api`/`requires_openai_auth`: keep Codex `responses`/`false` defaults,
   respectively. Optional auth timing/context settings: native defaults/semantics.
 
+- Local provider: operator-selected provider (config or selector) whose `base_url` is
+  an `http://` loopback IP literal with explicit port and `/v1` path, `responses` wire
+  API, no `requires_openai_auth`, `auth`, `env_key`, bearer token, headers, or query
+  params. Only provider selection + endpoint become `-c` overrides, with retries and
+  WebSockets off; context, catalogue, instructions, hooks, MCP stay unimported.
+- Local provider runs: empty isolated `CODEX_HOME`, no OpenAI credential/endpoint
+  env, no subscription probe or fallback; unsafe loopback config refuses before launch.
+  Non-loopback providers keep the routes above.
+
 - POSIX: private launcher restores validated caller `HOME` only for selected
   authentication executable. Engine/reviewer tools keep isolated environment/filesystem access.
 - Caller `HOME` must be available absolute directory; no repository-owned path

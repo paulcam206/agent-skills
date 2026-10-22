@@ -20,7 +20,7 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-from .test_autoreview_hardening import init_repo, load_helper, write_executable
+from .test_autoreview_hardening import fake_codex_script, init_repo, load_helper, write_executable
 
 
 class CodexInferenceRouteTests(unittest.TestCase):
@@ -689,6 +689,215 @@ class CodexInferenceRouteTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             self.run_review(during_run=respond)
         self.assertIn(marker, str(caught.exception))
+
+
+class CodexLoopbackProviderTests(unittest.TestCase):
+    ENDPOINT = "http://127.0.0.1:4141/v1"
+    CREDENTIALS = (
+        "OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY", "OPENAI_BASE_URL",
+        "OPENAI_ORGANIZATION", "OPENAI_PROJECT", "AZURE_OPENAI_ENDPOINT",
+    )
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="autoreview-loopback-test.")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.repo = init_repo(self.root)
+        self.home = self.root / "operator-home"
+        self.home.mkdir()
+        (self.home / "auth.json").write_text("fixture auth must not be read", encoding="utf-8")
+        self.helper = load_helper()
+        self.args = argparse.Namespace(
+            engine="codex", codex_bin="synthetic-codex", codex_config=[], codex_speed=None,
+            fallback_model=None, model="gpt-6-sol", stream_engine_output=False,
+            thinking=None, tools=True, web_search=False,
+        )
+        self.launches = []
+        environment = {key: "fixture-only" for key in self.CREDENTIALS}
+        environment.update({
+            "CODEX_HOME": str(self.home), "HOME": str(self.root),
+            "AUTOREVIEW_CODEX_CONFIG": "", "AUTOREVIEW_CODEX_SPEED": "",
+        })
+        patcher = mock.patch.dict(os.environ, environment)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_config(self, extra="", endpoint=ENDPOINT, home=None):
+        (home or self.home).joinpath("config.toml").write_text(
+            'model_provider = "fixture"\n'
+            "[model_providers.fixture]\n"
+            f"base_url = {json.dumps(endpoint)}\n{extra}\n"
+            '[mcp_servers.untrusted]\ncommand = "must-not-run"\n'
+            "[features]\nhooks = true\n",
+            encoding="utf-8",
+        )
+
+    def route_flags(self, overrides=()):
+        flags, catalogue = self.helper["load_codex_inference_route"](self.repo, list(overrides))
+        self.assertIsNone(catalogue)
+        return dict(flag.split("=", 1) for flag in flags if flag != "-c")
+
+    def run_review(self):
+        observed = {}
+
+        def fake_run(command, cwd, **kwargs):
+            self.launches.append(command)
+            observed["command"] = command
+            observed["env"] = kwargs["env"]
+            observed["auth_exists"] = (Path(kwargs["env"]["CODEX_HOME"]) / "auth.json").exists()
+            flags = [command[index + 1] for index, value in enumerate(command) if value == "-c"]
+            observed["flags"] = dict(flag.split("=", 1) for flag in flags)
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text('{"findings": []}')
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        replacements = {
+            "ensure_codex_isolation_supported": mock.Mock(return_value="synthetic-codex"),
+            "resolve_command": mock.Mock(return_value="synthetic-codex"),
+            "run_with_heartbeat": fake_run,
+            "prepare_codex_runtime_auth": mock.Mock(
+                side_effect=AssertionError("a local provider must not link credential files")
+            ),
+            "codex_subscription_login_missing": mock.Mock(
+                side_effect=AssertionError("a local provider must not probe subscription login")
+            ),
+        }
+        with mock.patch.dict(self.helper["run_codex"].__globals__, replacements):
+            observed["report"] = self.helper["run_codex"](self.args, self.repo, "synthetic review")
+        return observed
+
+    def test_configured_loopback_provider_reaches_isolated_review(self):
+        self.write_config('name = "operator label"\nrequest_max_retries = 9\n')
+        observed = self.run_review()
+        flags = observed["flags"]
+        self.assertEqual(flags["model_provider"], '"fixture"')
+        self.assertEqual(flags["model_providers.fixture.base_url"], f'"{self.ENDPOINT}"')
+        self.assertEqual(flags["model_providers.fixture.name"], '"fixture"')
+        self.assertEqual(flags["model_providers.fixture.wire_api"], '"responses"')
+        self.assertEqual(flags["model_providers.fixture.requires_openai_auth"], "false")
+        self.assertEqual(flags["model_providers.fixture.supports_websockets"], "false")
+        self.assertEqual(flags["model_providers.fixture.request_max_retries"], "0")
+        self.assertEqual(flags["model_providers.fixture.stream_max_retries"], "0")
+        # Operator instructions, hooks, MCP servers, and credentials stay behind.
+        self.assertEqual(flags["features.hooks"], "false")
+        self.assertFalse(any("must-not-run" in value for value in observed["command"]))
+        self.assertFalse(any(key.startswith("mcp_servers") for key in flags))
+        self.assertIn("--ignore-user-config", observed["command"])
+        self.assertIn("--ignore-rules", observed["command"])
+        self.assertNotEqual(Path(observed["env"]["CODEX_HOME"]).resolve(), self.home.resolve())
+        self.assertFalse(observed["auth_exists"])
+        self.assertEqual([key for key in self.CREDENTIALS if key in observed["env"]], [])
+        self.assertEqual(observed["report"], '{"findings": []}')
+
+    def test_explicit_selector_projects_the_same_loopback_route(self):
+        self.write_config()
+        configured = self.route_flags()
+        selected = self.route_flags(['model_provider="fixture"'])
+        self.assertEqual(selected, configured)
+        self.assertEqual(selected["model_providers.fixture.base_url"], f'"{self.ENDPOINT}"')
+        self.args.codex_config = ['model_provider="fixture"']
+        self.assertEqual(self.run_review()["flags"]["model_provider"], '"fixture"')
+
+    def test_ipv6_loopback_provider_is_projected(self):
+        self.write_config(endpoint="http://[::1]:4141/v1/")
+        self.assertEqual(
+            self.route_flags()["model_providers.fixture.base_url"], '"http://[::1]:4141/v1/"',
+        )
+
+    def test_credential_bearing_provider_is_refused_before_launch(self):
+        for extra in (
+            "requires_openai_auth = true",
+            'env_key = "FIXTURE_KEY"',
+            'experimental_bearer_token = "fixture-only"',
+            'http_headers = { Authorization = "fixture-only" }',
+            'env_http_headers = { Authorization = "FIXTURE_KEY" }',
+            'query_params = { key = "fixture-only" }',
+            'auth = { command = "fixture-helper" }',
+            'wire_api = "chat"',
+        ):
+            with self.subTest(extra=extra):
+                self.write_config(extra)
+                with self.assertRaisesRegex(SystemExit, "unauthenticated HTTP loopback"):
+                    self.run_review()
+                self.assertEqual(self.launches, [])
+
+    def test_unsafe_endpoints_are_refused_before_launch(self):
+        for endpoint in (
+            "http://127.0.0.1:4141/other",
+            "http://127.0.0.1:4141/v1?fixture=1",
+            "http://127.0.0.1:4141/v1#fixture",
+            "http://fixture@127.0.0.1:4141/v1",
+            "https://127.0.0.1:4141/v1",
+            "http://127.0.0.1/v1",
+            "http://127.0.0.1:0/v1",
+            "http://127.0.0.1:invalid/v1",
+        ):
+            with self.subTest(endpoint=endpoint):
+                self.write_config(endpoint=endpoint)
+                with self.assertRaisesRegex(SystemExit, "local provider"):
+                    self.run_review()
+                self.assertEqual(self.launches, [])
+
+    def test_unsafe_provider_is_refused_for_an_explicit_selector_too(self):
+        self.write_config('env_key = "FIXTURE_KEY"')
+        self.args.codex_config = ['model_provider="fixture"']
+        with self.assertRaisesRegex(SystemExit, "unauthenticated HTTP loopback"):
+            self.run_review()
+        self.assertEqual(self.launches, [])
+
+    def test_real_child_process_receives_only_the_isolated_loopback_route(self):
+        capture = self.root / "child-env.json"
+        record = self.root / "child-run.json"
+        capture_code = (
+            f"Path({str(capture)!r}).write_text(json.dumps({{\n"
+            "    'home': os.environ.get('CODEX_HOME'),\n"
+            "    'authExists': (Path(os.environ['CODEX_HOME']) / 'auth.json').exists(),\n"
+            f"    'credentials': {{key: os.environ.get(key) for key in {self.CREDENTIALS!r}}},\n"
+            "}))\n"
+        )
+        marker = 'record = os.environ["AUTOREVIEW_FAKE_RECORD"]'
+        executable = write_executable(
+            self.root / "fake-codex", fake_codex_script().replace(marker, capture_code + marker),
+        )
+        self.args.codex_bin = str(executable)
+        self.write_config()
+        with mock.patch.dict(os.environ, {"AUTOREVIEW_FAKE_RECORD": str(record)}), mock.patch.dict(
+            self.helper["run_codex"].__globals__,
+            {"prepare_codex_runtime_auth": mock.Mock(
+                side_effect=AssertionError("a local provider must not link credential files")
+            )},
+        ):
+            output = self.helper["run_codex"](self.args, self.repo, "review only the validated bundle")
+        observed = json.loads(capture.read_text(encoding="utf-8"))
+        invocation = json.loads(record.read_text(encoding="utf-8"))
+        self.assertEqual(json.loads(output)["findings"], [])
+        self.assertNotEqual(Path(observed["home"]).resolve(), self.home.resolve())
+        self.assertFalse(observed["authExists"])
+        self.assertEqual(set(observed["credentials"].values()), {None})
+        self.assertIn('model_provider="fixture"', invocation["argv"])
+        self.assertIn(f'model_providers.fixture.base_url="{self.ENDPOINT}"', invocation["argv"])
+        self.assertIn("model_providers.fixture.stream_max_retries=0", invocation["argv"])
+        self.assertIn("--ignore-user-config", invocation["argv"])
+        self.assertFalse(any("must-not-run" in value for value in invocation["argv"]))
+        self.assertEqual(invocation["stdin"], "review only the validated bundle")
+
+    def test_remote_missing_and_repository_local_providers_are_not_a_source(self):
+        self.write_config(endpoint="https://example.invalid/v1")
+        self.assertNotIn("model_provider", self.route_flags())
+        (self.home / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+        self.assertNotIn("model_provider", self.route_flags())
+        (self.home / "config.toml").write_text('model_provider = "fixture"\n', encoding="utf-8")
+        self.assertNotIn("model_provider", self.route_flags())
+        local_home = self.repo / ".codex"
+        local_home.mkdir()
+        self.write_config(home=local_home)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(local_home)}):
+            self.assertNotIn("model_provider", self.route_flags())
+
+    def test_other_selected_provider_does_not_borrow_the_loopback_route(self):
+        self.write_config()
+        with self.assertRaisesRegex(SystemExit, "must match the operator config"):
+            self.route_flags(['model_provider="other"'])
 
 
 if __name__ == "__main__":
